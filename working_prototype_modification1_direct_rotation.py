@@ -1,0 +1,1336 @@
+from src.model.encoder import Encoder
+from src.model.types import Gaussians
+from src.model.encoder.common.gaussians import build_covariance
+from math import sqrt
+
+from pathlib import Path
+import torch
+import os
+import sys
+import pandas as pd
+from AnySplat.src.misc.image_io import save_interpolated_video
+from AnySplat.src.model.model.anysplat import AnySplat
+from AnySplat.src.model.encoder.vggt.utils import rotation
+#from src.utils.image import process_image
+from src.model.ply_export import export_ply
+import glob
+from os import listdir
+from os.path import isfile, join
+import cv2
+from optimizer_mesh import PoseOptimizer
+import numpy as np
+import matplotlib.pyplot as plt
+from plyfile import PlyData, PlyElement
+import json
+import sys
+import trimesh
+from networkx.algorithms.distance_measures import radius
+from plyfile import PlyData, PlyElement
+import trimesh
+import numpy as np
+import os
+from kittiseq10_config import Config
+#from scene.gaussian_model import GaussianModel, BasicPointCloud
+from pyntcloud import PyntCloud
+import pandas as pd
+import cv2
+from matplotlib import pyplot as plt
+from pathlib import Path
+import math
+import glob
+import random
+from scipy.spatial.transform import Rotation
+from gsplat import rasterization
+import torch
+import json
+from PIL import Image
+import torchvision
+import time
+
+NEAR_CLIP = 0.5  # metres — discard points closer than this
+FAR_CLIP = 160.0  # metres — discard points farther than this
+POINT_SIZE = 2  # blob radius in pixels (1 = single pixel)
+OVERLAY_ALPHA = 0.6  # mesh weight in the blended overlay image
+
+def process_image_helper(np_image):
+    img = Image.fromarray(np_image, 'RGB')
+    #img = Image.open(img_path)
+    if img.mode == 'RGBA':
+        # Convert RGBA to RGB by removing alpha channel
+        img = img.convert('RGB')
+    # Resize to maintain aspect ratio and then center crop to 448x448
+    width, height = img.size
+    if width > height:
+        new_height = 448
+        new_width = int(width * (new_height / height))
+    else:
+        new_width = 448
+        new_height = int(height * (new_width / width))
+    img = img.resize((new_width, new_height))
+
+    # Center crop
+    left = (new_width - 448) // 2
+    top = (new_height - 448) // 2
+    right = left + 448
+    bottom = top + 448
+    img = img.crop((left, top, right, bottom))
+    #img.show()
+    #time.sleep(10)
+    img_tensor = torchvision.transforms.ToTensor()(img) * 2.0 - 1.0  # [-1, 1]
+    return img_tensor
+
+def get_pixel_3d_coord(u, v, gaussians, H, W, view_idx=0, batch_idx=0):
+    """
+    Retrieves the 3D world coordinate directly from AnySplat's pixel-wise Gaussians.
+    u = column index (horizontal coordinate, 0 to W-1)
+    v = row index    (vertical coordinate, 0 to H-1)
+    """
+    # Calculate the flattened sequence index for the specific view and pixel
+    # AnySplat structures its token sequences row-major: view -> row (v) -> col (u)
+    pixel_flat_idx = (view_idx * H * W) + (v * W) + u
+
+    # Query directly from the Gaussian means tensor [Batch, Total_Pixels, 3]
+    world_xyz = gaussians.means[batch_idx, pixel_flat_idx]
+
+    return world_xyz.tolist()
+
+class Submap:
+    def __init__(self,config,frame_start,frame_end):
+        self.config = config
+        self.calib=pd.read_csv(config.calib_path, delimiter=' ', header=None, index_col=0)
+        p2 = np.array(self.calib.loc['P2:']).reshape((3, 4))
+        K, r2, t2, _, _, _, _ = cv2.decomposeProjectionMatrix(p2)
+        self.K = K
+        self.intrinsics_crop = K.copy()
+        self.intrinsics_crop[0,2]=112
+        self.intrinsics_crop[1,2]=112
+        self.R = r2
+        self.T = t2
+        self.img_h =config.img_h
+        self.img_w = config.img_w
+        self.frame_start = frame_start
+        self.frame_end = frame_end
+        self.vol_radius = 2
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.vol_origins_extracted = []
+
+
+    def init_model(self):
+        self.model = AnySplat.from_pretrained("lhjiang/anysplat")
+        self.model.encoder.cfg.voxelize=False
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self.model.to(device)
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+        return
+    def init_geometry(self,mesh_path):
+        self.poses=self.load_poses(Path(self.config.pose_path))
+        self.mesh = trimesh.load_mesh(mesh_path)
+        self.pcd = self.mesh.triangles_center.astype(np.float32)
+        self.centers = self.fetch_centroids(self.vol_radius)
+        self.images = self.fetch_images()
+        self.inverted_poses = self.invert_poses()
+        self.im_u = np.empty((0, len(self.centers)))
+        self.im_v = np.empty((0,len(self.centers)))
+        self.inside_mask = np.empty((0, len(self.centers)))
+
+        for i in range(len(self.images)):
+            u_centers, v_centers, in_img = self.project_centers(i)
+            self.im_u = np.vstack((self.im_u, u_centers))
+            self.im_v = np.vstack((self.im_v, v_centers))
+            self.inside_mask = np.vstack((self.inside_mask, in_img))
+        return
+
+    def init_model_inputs(self):
+        self.crop_dict = {}
+        self.center_shiftdict = {}
+        self.crop_starts_global = {}
+        for j in range(len(self.centers)):
+            for k in range(self.frame_end):
+                if self.inside_mask[k][j]:
+                    #print(self.im_u[k][j], self.im_v[k][j])
+                    crop, centershift, start_points = self.extract_window_no_padding(self.images[k], int(self.im_u[k][j]),
+                                                                         int(self.im_v[k][j]), plot=False)
+                    self.center_shiftdict[str("center" + str(j) + "image" + str(k))] = {"x_shift": str(centershift[0]),
+                                                                                        "y_shift": str(centershift[1])}
+                    self.crop_starts_global[str("center" + str(j) + "image" + str(k))] = {"x": str(start_points[0]),
+                                                                                   "y": str(start_points[1])}
+                    self.crop_dict[str("center" + str(j) + "image" + str(k))] = {"crop": crop}
+                    #cv2.imwrite('/home/luis/Desktop/PythonProjects/2026-schmid-luis-mt/mini-splatting2/output/cropped2m/center' + str(j) + 'image' + str(k) + '.png', crop)
+        return
+    def render_splat(self,gaussians,pred_all_extrinsic,pred_all_intrinsic,img1,img2,h=224*2,w=224*2):
+
+        interpolated_output = self.model.decoder.forward(
+            gaussians,
+            pred_all_extrinsic,
+            pred_all_intrinsic.float(),
+            torch.ones(1, 2, device=pred_all_extrinsic.device) * 0.1,
+            torch.ones(1, 2, device=pred_all_extrinsic.device) * 100,
+            (h, w),
+        )
+
+        video = interpolated_output.color[0].clip(min=0, max=1)
+
+        video = video.cpu().detach().numpy()  # (N, C, H, W)
+        video = np.transpose(video, (0, 2, 3, 1))  # (N, H, W, C)
+
+        # Scale to [0, 255] and convert to uint8
+        video = (video * 255).astype(np.uint8)
+
+        f, axarr = plt.subplots(2, 2)
+        axarr[0, 0].imshow(img1)
+        axarr[0, 1].imshow(video[0,:,:,:])
+        axarr[1, 0].imshow(img2)
+        axarr[1, 1].imshow(video[1,:,:,:])
+        plt.show()
+        time.sleep(1)
+
+        #    cv2.imwrite(crop_paths[googoldcounter].replace('cropped2m','cropped2mreconstructed'),frame)
+        #    googoldcounter+=1
+        return
+
+
+    def render_splat_ret_img(self,means,scale,rot,harmonics, opacity,covariance,extrinsics,intrinsics,h=224*2,w=224*2):
+
+        extrinsics_tensor = torch.tensor(np.linalg.inv(extrinsics), dtype=torch.float32, device="cuda")[None]
+        intrinsics_tensor = torch.tensor(intrinsics, dtype=torch.float32, device="cuda")[None]
+        background_color = torch.tensor(np.array([1, 1, 1]), dtype=torch.float32, device="cuda")[None][0]
+        feature = harmonics.permute(0, 1, 3, 2).contiguous()[0].float()
+        rendering, alpha, _ = rasterization(means[0].float(), rot[0].float(),
+                                            scale[0].float(), opacity[0].float(), feature,
+                                            extrinsics_tensor.float(), intrinsics_tensor.float(), w, h,
+                                            sh_degree=(int(sqrt(feature.shape[-2])) - 1),
+                                            # near_plane=near[i].mean(), far_plane=far[i].mean(),
+                                            render_mode="RGB+D", packed=False,
+                                            near_plane=1e-10,
+                                            backgrounds=background_color.unsqueeze(0).repeat(1, 1),
+                                            radius_clip=0.1,
+                                            covars=covariance[0].float(),
+                                            rasterize_mode='classic')  # (V, H, W, 3)
+        rendering_img, rendering_depth = torch.split(rendering, [3, 1], dim=-1)
+        rendering_img = (rendering_img.clamp(0.0, 1.0).cpu().detach().numpy()[0] * 255).astype(np.uint8)
+        return rendering_img, rendering_depth.cpu().detach().numpy()[0]
+
+    def pipeline_foward(self):
+        for i in range(len(self.centers)):
+
+            crop_paths=list(filter(lambda x: x.startswith("center"+str(i)+"image"), sorted(list(self.center_shiftdict.keys()))))
+            crop_paths=[crop_paths[0],crop_paths[-1]]
+            #print(crop_paths)
+            imagenr1 = int(crop_paths[0].removeprefix("center"+str(i)+"image"))
+            imagenr2 = int(crop_paths[1].removeprefix("center"+str(i)+"image"))
+            images = [process_image_helper(self.crop_dict[crop_paths[0]]["crop"]),process_image_helper(self.crop_dict[crop_paths[-1]]["crop"])]
+            images = torch.stack(images, dim=0).unsqueeze(0).to(self.device)  # [1, K, 3, 448, 448]
+            b, v, _, h, w = images.shape
+
+
+            crop_startx1=int(self.crop_starts_global[crop_paths[0]]['x'])
+            crop_starty1=int(self.crop_starts_global[crop_paths[0]]['y'])
+            crop_startx2=int(self.crop_starts_global[crop_paths[1]]['x'])
+            crop_starty2=int(self.crop_starts_global[crop_paths[1]]['y'])
+
+            target_u1, target_v1 = 112-int(self.center_shiftdict[crop_paths[0]]['x_shift']), 112-int(self.center_shiftdict[crop_paths[0]]['y_shift'])
+            target_u2, target_v2 = 112-int(self.center_shiftdict[crop_paths[1]]['x_shift']), 112-int(self.center_shiftdict[crop_paths[1]]['y_shift'])
+            plot=True
+            if plot:
+                image1=self.crop_dict[crop_paths[0]]["crop"].copy()
+                image2=self.crop_dict[crop_paths[-1]]["crop"].copy()
+                image1[target_v1][target_u1] = [255, 0, 0]
+                image2[target_v2][target_u2] = [255, 0, 0]
+                try:
+                    image1[target_v1+1][target_u1] = [255, 0, 0]
+                    image2[target_v2+1][target_u2] = [255, 0, 0]
+                    image1[target_v1-1][target_u1] = [255, 0, 0]
+                    image2[target_v2-1][target_u2] = [255, 0, 0]
+                    image1[target_v1][target_u1+1] = [255, 0, 0]
+                    image2[target_v2][target_u2+1] = [255, 0, 0]
+                    image1[target_v1][target_u1-1] = [255, 0, 0]
+                    image2[target_v2][target_u2-1] = [255, 0, 0]
+                except:
+                    print('couldnt fill all surrounding pixels')
+                #f, axarr = plt.subplots(2, 1)
+                #axarr[0].imshow(image1)
+                #axarr[1].imshow(image2)
+                cv2.imwrite('/home/luis/Desktop/PythonProjects/2026-schmid-luis-mt/minisplatting2/output/cropswithcenter2m/center' + str(i) +'image1'+ '.png', image1)
+                cv2.imwrite('/home/luis/Desktop/PythonProjects/2026-schmid-luis-mt/minisplatting2/output/cropswithcenter2m/center' + str(i) +'image2'+ '.png', image2)
+                #plt.show()
+            distance1 = np.linalg.norm(self.centers[i] - self.poses[imagenr1][0:3,3:].reshape((3,)))
+            distance2 = np.linalg.norm(self.centers[i] - self.poses[imagenr2][0:3,3:].reshape((3,)))
+            print('Distance '+crop_paths[0],distance1,self.centers[i],self.poses[imagenr1][0:3,3:].reshape((3,)))
+            print('Distance '+crop_paths[1],distance2,self.centers[i],self.poses[imagenr2][0:3,3:].reshape((3,)))
+            print(self.im_u[imagenr1][i],self.im_v[imagenr1][i])
+            self.model.encoder.pixeldepth1 = (target_u1,target_v1,distance1)
+            self.model.encoder.pixeldepth2 = (target_u2,target_v2,distance1)
+
+            extrinsics1 = self.poses[imagenr1]
+            extrinsics2 = self.poses[imagenr2]
+            extrinsics_inv1 = self.inverted_poses[imagenr1]
+            extrinsics_inv2 = self.inverted_poses[imagenr2]
+
+            self.model.encoder.extrinsics1 = extrinsics1
+            self.model.encoder.extrinsics2 = extrinsics2
+            intrinsicsfxy = 707.09
+            self.model.encoder.intrinsicsfxy = intrinsicsfxy
+            images = (images + 1) * 0.5
+
+            gaussians, pred_context_pose = self.model.inference(images)
+            gaussians =Gaussians(
+                means=torch.tensor(gaussians.means[0].cpu().detach().numpy()[0:448*448], dtype=torch.float32, device="cuda")[None],
+                covariances=torch.tensor(gaussians.covariances[0].cpu().detach().numpy()[0:448*448], dtype=torch.float32, device="cuda")[None],
+                harmonics=torch.tensor(gaussians.harmonics[0].cpu().detach().numpy()[0:448*448], dtype=torch.float32, device="cuda")[None],
+                opacities=torch.tensor(gaussians.opacities[0].cpu().detach().numpy()[0:448*448], dtype=torch.float32, device="cuda")[None],
+                scales=torch.tensor(gaussians.scales[0].cpu().detach().numpy()[0:448*448], dtype=torch.float32, device="cuda")[None],
+                rotations=torch.tensor(gaussians.rotations[0].cpu().detach().numpy()[0:448*448], dtype=torch.float32, device="cuda")[None],
+            )
+            pred_all_extrinsic = pred_context_pose['extrinsic']
+
+            pred_all_intrinsic = pred_context_pose['intrinsic']
+            predicted_extrinsics =pred_all_extrinsic.cpu().detach().numpy()[0]
+            predicted_intrinsics = pred_all_intrinsic.cpu().detach().numpy()[0]
+            predicted_intrinsics_448 = predicted_intrinsics.copy()
+            predicted_intrinsics_448[:,0:2,:]=predicted_intrinsics_448[:,0:2,:]*448
+
+            w_gaussians = self.transform_gaussians_any(gaussians,np.linalg.inv(predicted_extrinsics[0])[0:3,0:3],np.linalg.inv(predicted_extrinsics[0])[3,0:3])
+            w_extrinsics1 =np.array([[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]])
+            w_extrinsics2=np.linalg.inv(predicted_extrinsics[0])@ predicted_extrinsics[1]
+            inv_pred_ex1=np.linalg.inv(predicted_extrinsics[0])
+            inv_pred_ex2=np.linalg.inv(predicted_extrinsics[1])
+            inv_pred_w_ex1=np.linalg.inv(w_extrinsics1)
+            inv_pred_w_ex2=np.linalg.inv(w_extrinsics2)
+            cutom_intr = predicted_intrinsics_448.copy()
+            cutom_intr[0,0,2]=112
+            cutom_intr[0,1,2]=112
+            cutom_intr[1,0,2]=112
+            cutom_intr[1,1,2]=112
+
+            depths_scalar1=self.model.encoder.depths_scalar1
+            depths_scalar2=self.model.encoder.depths_scalar2
+            mean_coord1 = self.model.encoder.meancoord1
+            mean_coord2 = self.model.encoder.meancoord2
+            depth_pixel1 = self.model.encoder.depths_of_pixel1
+            depth_pixel2 = self.model.encoder.depths_of_pixel2
+
+
+            means = gaussians.means[0].clone().cpu().detach().numpy()
+            scales =gaussians.scales[0].clone().cpu().detach().numpy()
+            rotations = gaussians.rotations[0].clone().cpu().detach().numpy()
+            harmonics=gaussians.harmonics[0].clone().cpu().detach().numpy()
+            opacities=gaussians.opacities[0].clone().cpu().detach().numpy()
+
+            w_means = w_gaussians.means[0].clone().cpu().detach().numpy()
+            w_scales =w_gaussians.scales[0].clone().cpu().detach().numpy()
+            w_rotations = w_gaussians.rotations[0].clone().cpu().detach().numpy()
+            w_harmonics=w_gaussians.harmonics[0].clone().cpu().detach().numpy()
+            w_opacities=w_gaussians.opacities[0].clone().cpu().detach().numpy()
+
+            means1 = gaussians.means[0].clone().cpu().detach().numpy()
+            scales1 =gaussians.scales[0].clone().cpu().detach().numpy()
+            rotations1 = gaussians.rotations[0].clone().cpu().detach().numpy()
+            harmonics1=gaussians.harmonics[0].clone().cpu().detach().numpy()
+            opacities1=gaussians.opacities[0].clone().cpu().detach().numpy()
+
+            means2 = gaussians.means[0].clone().cpu().detach().numpy()
+            scales2 =gaussians.scales[0].clone().cpu().detach().numpy()
+            rotations2 = gaussians.rotations[0].clone().cpu().detach().numpy()
+            harmonics2=gaussians.harmonics[0].clone().cpu().detach().numpy()
+            opacities2=gaussians.opacities[0].clone().cpu().detach().numpy()
+
+            exact_center = np.array([[mean_coord1[0],mean_coord1[1],mean_coord1[2]]])
+            w_exact_center = np.array([np.linalg.inv(predicted_extrinsics[0])[0:3,0:3]@exact_center[0].copy()+np.linalg.inv(predicted_extrinsics[0])[3,0:3]])
+            w_exact_center_zscale=w_exact_center
+            w_exact_center_zscale[:,2]=w_exact_center_zscale[:,2]*2
+
+            exact_centerd = np.array([[mean_coord1[0],mean_coord1[1],mean_coord1[2]]])*depths_scalar1
+            exact_centerhd = np.array([[mean_coord1[0],mean_coord1[1],mean_coord1[2]]])*depths_scalar1/2
+
+            w_means_zscaled=w_means
+            w_means_zscaled[:,2]=w_means_zscaled[:,2]*2
+            w_dist1=np.linalg.norm(w_exact_center_zscale)
+            w_dscale = distance1 / w_dist1
+            w_exact_center_dscale =w_exact_center_zscale*w_dscale
+            w_means_dscale = w_means_zscaled*w_dscale
+            w_scales_dscale=w_scales*w_dscale
+            w_mask_d =np.linalg.norm(w_means_dscale - w_exact_center_dscale, axis=1) <= self.vol_radius
+
+            w_means_dscale_t=torch.tensor(w_means_dscale, dtype=torch.float32, device="cuda")[None]
+            w_scales_dscale_t = torch.tensor(w_scales_dscale, dtype=torch.float32, device="cuda")[None]
+            w_rotations_dscale_t = torch.tensor(w_rotations, dtype=torch.float32, device="cuda")[None]
+            w_harmonics_dscale_t = torch.tensor(w_harmonics, dtype=torch.float32, device="cuda")[None]
+            w_opacities_dscale_t = torch.tensor(w_opacities, dtype=torch.float32, device="cuda")[None]
+            w_covariance_dscale_t = build_covariance(w_scales_dscale_t,w_rotations_dscale_t)
+
+
+            exact_center_zscale =exact_center@inv_pred_ex1[0:3,0:3].T+np.array([inv_pred_ex1[0:3,3]])
+
+            e1means=means@inv_pred_ex1[0:3,0:3].T+np.array([inv_pred_ex1[0:3,3]])
+            #e1means=e1means+means_proj_center_w
+            e1means[:,2]=e1means[:,2]*2
+            means_zscale=e1means@predicted_extrinsics[0][0:3,0:3].T+np.array([predicted_extrinsics[0][0:3,3]])
+            exact_center_zscale[:,2]=exact_center_zscale[:,2]*2
+            exact_center_zscale=exact_center_zscale@predicted_extrinsics[0][0:3,0:3].T+np.array([predicted_extrinsics[0][0:3,3]])
+
+            means_zscale_t=torch.tensor(means_zscale, dtype=torch.float32, device="cuda")[None]
+            scales_zscale_t = torch.tensor(scales, dtype=torch.float32, device="cuda")[None]
+            rotations_zscale_t = torch.tensor(rotations, dtype=torch.float32, device="cuda")[None]
+            harmonics_zscale_t = torch.tensor(harmonics, dtype=torch.float32, device="cuda")[None]
+            opacities_zscale_t = torch.tensor(opacities, dtype=torch.float32, device="cuda")[None]
+            covariance_zscale_t = build_covariance(scales_zscale_t,rotations_zscale_t)
+            gaussians_z= Gaussians(
+                means=means_zscale_t,
+                covariances=covariance_zscale_t,
+                harmonics=harmonics_zscale_t,
+                opacities=opacities_zscale_t,
+                scales=scales_zscale_t,
+                rotations=rotations_zscale_t,
+            )
+
+            w_gaussians_zscaled_inv = self.transform_gaussians_any(gaussians_z,np.linalg.inv(predicted_extrinsics[0])[0:3,0:3],np.linalg.inv(predicted_extrinsics[0])[3,0:3])
+            w_gaussians_zscaled = self.transform_gaussians_any(gaussians_z,predicted_extrinsics[0][0:3,0:3],predicted_extrinsics[0][3,0:3])
+
+            distance_zscale =np.linalg.norm(exact_center_zscale-np.array([predicted_extrinsics[0][0:3,3]]))
+            print(distance1,distance_zscale)
+
+            dscale = distance1/distance_zscale
+            exact_center_dscale =exact_center_zscale*dscale
+            means_dscale = means_zscale*dscale
+            scales_dscale=scales1*dscale
+            premasksum =np.linalg.norm(means_dscale - exact_center_dscale, axis=1)
+            mask_d = premasksum <= self.vol_radius
+
+            print('Distance mesh:', distance1)
+            print('Distance gaussian center:', np.linalg.norm(exact_center_dscale-np.array([predicted_extrinsics[0][0:3,3]])))
+
+
+
+            gaussians_masked= Gaussians(
+                means=w_means_dscale_t,
+                covariances=w_covariance_dscale_t,
+                harmonics=w_harmonics_dscale_t,
+                opacities=w_opacities_dscale_t,
+                scales=w_scales_dscale_t,
+                rotations=w_rotations_dscale_t,
+            )
+
+            #correct_gaussians = self.transform_gaussians_individual(gaussians_z,w_extrinsics1,cutom_intr[0],(crop_startx1,crop_starty1))
+            #correct_gaussians, correct_gaussians_center = self.transform_gaussians_individual(gaussians_z,predicted_extrinsics[0],cutom_intr[0],(crop_startx1,crop_starty1), distance1,(target_u1,target_v1))
+            correct_gaussians, correct_gaussians_center = self.transform_gaussians_individual2(gaussians_z,predicted_extrinsics[0],cutom_intr[0],(crop_startx1,crop_starty1), distance1,(target_u1,target_v1),extrinsics1)
+
+            #correct_gaussians = gaussians_z
+
+            correct_means = correct_gaussians.means[0].clone().cpu().detach().numpy()
+            correct_scales =correct_gaussians.scales[0].clone().cpu().detach().numpy()
+            correct_rotations = correct_gaussians.rotations[0].clone().cpu().detach().numpy()
+            correct_harmonics=correct_gaussians.harmonics[0].clone().cpu().detach().numpy()
+            correct_opacities=correct_gaussians.opacities[0].clone().cpu().detach().numpy()
+            correct_covariances=correct_gaussians.covariances[0].clone().cpu().detach().numpy()
+
+            center=self.centers[i].copy()
+            w_center = extrinsics_inv1[0:3,0:3]@center+extrinsics_inv1[3,0:3]
+            w_center2 = extrinsics1[0:3,0:3]@center+extrinsics1[3,0:3]
+            original_pixel_coordinate = np.array([crop_startx1+target_u1,crop_starty1+target_v1])
+            w_origin,w_direction = self.pixel_to_world_ray(original_pixel_coordinate,self.K,w_extrinsics1)
+            w_center3=w_origin+(w_direction*np.linalg.norm(w_exact_center_dscale))
+
+            correct_mask =np.linalg.norm(correct_means - np.array(correct_gaussians_center), axis=1) <= self.vol_radius
+
+            correct_means_tm=torch.tensor(correct_means[correct_mask], dtype=torch.float32, device="cuda")[None]
+            correct_scales_tm = torch.tensor(correct_scales[correct_mask], dtype=torch.float32, device="cuda")[None]
+            correct_rotations_tm = torch.tensor(correct_rotations[correct_mask], dtype=torch.float32, device="cuda")[None]
+            correct_harmonics_tm = torch.tensor(correct_harmonics[correct_mask], dtype=torch.float32, device="cuda")[None]
+            correct_opacities_tm = torch.tensor(correct_opacities[correct_mask], dtype=torch.float32, device="cuda")[None]
+            correct_covariances_tm = build_covariance(correct_scales_tm,correct_rotations_tm)
+
+            Worldrotation=self.rotation_matrix_from_vectors(correct_gaussians_center,self.centers[i])
+            rotated=correct_gaussians_center@Worldrotation
+            rotated_inv=correct_gaussians_center@np.linalg.inv(Worldrotation)
+            Worldtranslation=self.centers[i].copy()-rotated_inv
+            print('WorldCenterPoints: ',correct_gaussians_center,self.centers[i])
+
+            print('roapply1: ', rotated)
+            print('roapply2: ', rotated_inv)
+
+            corrected_gaussians_masked= Gaussians(
+                means=correct_means_tm,
+                covariances=correct_covariances_tm,
+                harmonics=correct_harmonics_tm,
+                opacities=correct_opacities_tm,
+                scales=correct_scales_tm,
+                rotations=correct_rotations_tm,
+            )
+
+            og_ex_gaussians = self.transform_gaussians_any(corrected_gaussians_masked,Worldrotation,Worldtranslation)
+
+            v1_gs_og, v1_gs_og_depth = self.render_splat_ret_img(means=gaussians.means,
+                                                       scale=gaussians.scales,
+                                                       rot=gaussians.rotations,
+                                                       harmonics=gaussians.harmonics,
+                                                       opacity=gaussians.opacities,
+                                                       covariance=gaussians.covariances,
+                                                       extrinsics=predicted_extrinsics[0],
+                                                       intrinsics=predicted_intrinsics_448[0],
+                                                       h=448,
+                                                       w=448)
+            v2_gs_og, v2_gs_og_depth = self.render_splat_ret_img(means=gaussians.means,
+                                                       scale=gaussians.scales,
+                                                       rot=gaussians.rotations,
+                                                       harmonics=gaussians.harmonics,
+                                                       opacity=gaussians.opacities,
+                                                       covariance=gaussians.covariances,
+                                                       extrinsics=predicted_extrinsics[1],
+                                                       intrinsics=predicted_intrinsics_448[1],
+                                                       h=448,
+                                                       w=448)
+
+            v1_gs_og_z, v1_gs_og_z_depth = self.render_splat_ret_img(means=means_zscale_t,
+                                                       scale=scales_zscale_t,
+                                                       rot=rotations_zscale_t,
+                                                       harmonics=harmonics_zscale_t,
+                                                       opacity=opacities_zscale_t,
+                                                       covariance=covariance_zscale_t,
+                                                       extrinsics=predicted_extrinsics[0],
+                                                       intrinsics=predicted_intrinsics_448[0],
+                                                       h=448,
+                                                       w=448)
+            v2_gs_og_z, v2_gs_og_z_depth = self.render_splat_ret_img(means=means_zscale_t,
+                                                       scale=scales_zscale_t,
+                                                       rot=rotations_zscale_t,
+                                                       harmonics=harmonics_zscale_t,
+                                                       opacity=opacities_zscale_t,
+                                                       covariance=covariance_zscale_t,
+                                                       extrinsics=predicted_extrinsics[1],
+                                                       intrinsics=predicted_intrinsics_448[1],
+                                                       h=448,
+                                                       w=448)
+            v1_gs_og_zw, v1_gs_og_zw_depth = self.render_splat_ret_img(means=og_ex_gaussians.means,
+                                                       scale=og_ex_gaussians.scales,
+                                                       rot=og_ex_gaussians.rotations,
+                                                       harmonics=og_ex_gaussians.harmonics,
+                                                       opacity=og_ex_gaussians.opacities,
+                                                       covariance=og_ex_gaussians.covariances,
+                                                       extrinsics=extrinsics1,
+                                                       intrinsics=self.K,
+                                                       h=self.img_h,
+                                                       w=self.img_w)
+            v2_gs_og_zw, v2_gs_og_zw_depth = self.render_splat_ret_img(means=og_ex_gaussians.means,
+                                                       scale=og_ex_gaussians.scales,
+                                                       rot=og_ex_gaussians.rotations,
+                                                       harmonics=og_ex_gaussians.harmonics,
+                                                       opacity=og_ex_gaussians.opacities,
+                                                       covariance=og_ex_gaussians.covariances,
+                                                       extrinsics=extrinsics2,
+                                                       intrinsics=self.K,
+                                                       h=self.img_h,
+                                                       w=self.img_w)
+            v1_gs_og_zw2, v1_gs_og_zw_depth2 = self.render_splat_ret_img(means=w_gaussians_zscaled_inv.means,
+                                                       scale=w_gaussians_zscaled_inv.scales,
+                                                       rot=w_gaussians_zscaled_inv.rotations,
+                                                       harmonics=w_gaussians_zscaled_inv.harmonics,
+                                                       opacity=w_gaussians_zscaled_inv.opacities,
+                                                       covariance=w_gaussians_zscaled_inv.covariances,
+                                                       extrinsics=w_extrinsics1,
+                                                       intrinsics=predicted_intrinsics_448[0],
+                                                       h=448,
+                                                       w=448)
+            v2_gs_og_zw2, v2_gs_og_zw_depth2 = self.render_splat_ret_img(means=w_gaussians_zscaled_inv.means,
+                                                       scale=w_gaussians_zscaled_inv.scales,
+                                                       rot=w_gaussians_zscaled_inv.rotations,
+                                                       harmonics=w_gaussians_zscaled_inv.harmonics,
+                                                       opacity=w_gaussians_zscaled_inv.opacities,
+                                                       covariance=w_gaussians_zscaled_inv.covariances,
+                                                       extrinsics=w_extrinsics2,
+                                                       intrinsics=predicted_intrinsics_448[1],
+                                                       h=448,
+                                                       w=448)
+            v1_gs_corrected, v1_gs_corrected_depth = self.render_splat_ret_img(means=correct_gaussians.means,
+                                                       scale=correct_gaussians.scales,
+                                                       rot=correct_gaussians.rotations,
+                                                       harmonics=correct_gaussians.harmonics,
+                                                       opacity=correct_gaussians.opacities,
+                                                       covariance=correct_gaussians.covariances,
+                                                       extrinsics=w_extrinsics1,
+                                                       intrinsics=self.K,
+                                                       h=self.img_h,
+                                                       w=self.img_w)
+            v2_gs_corrected, v2_gs_corrected_depth = self.render_splat_ret_img(means=correct_gaussians.means,
+                                                       scale=correct_gaussians.scales,
+                                                       rot=correct_gaussians.rotations,
+                                                       harmonics=correct_gaussians.harmonics,
+                                                       opacity=correct_gaussians.opacities,
+                                                       covariance=correct_gaussians.covariances,
+                                                       extrinsics=w_extrinsics2,
+                                                       intrinsics=self.K,
+                                                       h=self.img_h,
+                                                       w=self.img_w)
+            v1_gs_corrected_masked, v1_gs_corrected_masked_depth = self.render_splat_ret_img(means=correct_means_tm,
+                                                       scale=correct_scales_tm,
+                                                       rot=correct_rotations_tm,
+                                                       harmonics=correct_harmonics_tm,
+                                                       opacity=correct_opacities_tm,
+                                                       covariance=correct_covariances_tm,
+                                                       extrinsics=predicted_extrinsics[0],
+                                                       intrinsics=self.K,
+                                                       h=self.img_h,
+                                                       w=self.img_w)
+            v2_gs_corrected_masked, v2_gs_corrected_masked_depth = self.render_splat_ret_img(means=correct_means_tm,
+                                                       scale=correct_scales_tm,
+                                                       rot=correct_rotations_tm,
+                                                       harmonics=correct_harmonics_tm,
+                                                       opacity=correct_opacities_tm,
+                                                       covariance=correct_covariances_tm,
+                                                       extrinsics=predicted_extrinsics[1],
+                                                       intrinsics=self.K,
+                                                       h=self.img_h,
+                                                       w=self.img_w)
+
+
+            f, axarr = plt.subplots(2, 6)
+            axarr[0, 0].imshow(self.images[imagenr1][crop_starty1:crop_starty1 + 224, crop_startx1:crop_startx1 + 224, :])
+            axarr[0, 0].set_title('view1')
+            axarr[0, 1].imshow(v1_gs_og_zw[crop_starty1:crop_starty1 + 224, crop_startx1:crop_startx1 + 224, :])
+            axarr[0, 1].set_title('v1_gs_og_zw_crop')
+            axarr[0, 2].imshow(v1_gs_og_zw)
+            axarr[0, 2].set_title('v1_gs_og_zw')
+            axarr[0, 3].imshow(v1_gs_corrected[crop_starty1:crop_starty1 + 224, crop_startx1:crop_startx1 + 224, :])
+            axarr[0, 3].set_title('v1_gs_corrected')
+            axarr[0, 4].imshow(v1_gs_corrected_masked[crop_starty1:crop_starty1 + 224, crop_startx1:crop_startx1 + 224, :])
+            axarr[0, 4].set_title('v1_gs_corrected_masked')
+            axarr[0, 5].imshow(v1_gs_og)
+            axarr[0, 5].set_title('v1_gs_og')
+            axarr[1, 0].imshow(self.images[imagenr2][crop_starty2:crop_starty2 + 224, crop_startx2:crop_startx2 + 224, :])
+            axarr[1, 0].set_title('view2')
+            axarr[1, 1].imshow(v2_gs_og_zw[crop_starty2:crop_starty2 + 224, crop_startx2:crop_startx2 + 224, :])
+            axarr[1, 1].set_title('v2_gs_og_zw_crop')
+            axarr[1, 2].imshow(v2_gs_og_zw)
+            axarr[1, 2].set_title('v2_gs_og_zw')
+            axarr[1, 3].imshow(v2_gs_corrected[crop_starty2:crop_starty2 + 224, crop_startx2:crop_startx2 + 224, :])
+            axarr[1, 3].set_title('v2_gs_corrected')
+            axarr[1, 4].imshow(v2_gs_corrected_masked[crop_starty2:crop_starty2 + 224, crop_startx2:crop_startx2 + 224, :])
+            axarr[1, 4].set_title('v2_gs_corrected_masked')
+            axarr[1, 5].imshow(v2_gs_og)
+            axarr[1, 5].set_title('v2_gs_og')
+            plt.show()
+            time.sleep(1)
+            export_ply(og_ex_gaussians.means[0], og_ex_gaussians.scales[0], og_ex_gaussians.rotations[0], og_ex_gaussians.harmonics[0],
+                       og_ex_gaussians.opacities[0], Path('/home/luis/Desktop/PythonProjects/2026-schmid-luis-mt/minisplatting2/output/gaussians'+str(self.vol_radius)+'m2picsoptim') / ("gaussiansoptim"+str(i)+".ply"))
+
+        return
+
+    def rotation_matrix_from_vectors(self,vec_a, vec_b):
+        """Find the rotation matrix that aligns vec_a to vec_b."""
+        a = vec_a / np.linalg.norm(vec_a)
+        b = vec_b / np.linalg.norm(vec_b)
+        v = np.cross(a, b)
+        c = np.dot(a, b)
+        s = np.linalg.norm(v)
+
+        if s == 0:
+            return np.identity(3)  # Vectors are identical or opposite
+
+        # Skew-symmetric cross-product matrix of v
+        v_x = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+
+        # Rodrigues' rotation formula
+        r = np.identity(3) + v_x + (v_x @ v_x) * ((1 - c) / (s ** 2))
+        return r
+    def pixel_to_world_ray(self,pixel, K, extrinsics):
+        """
+        Convert a pixel into a ray in world coordinates.
+
+        Parameters
+        ----------
+        pixel : array-like
+            [u, v] pixel coordinates
+
+        K : (3, 3) ndarray
+            Camera intrinsic matrix
+
+        R : (3, 3) ndarray
+            Camera-to-world rotation matrix
+
+        t : (3,) ndarray
+            Camera-to-world translation
+
+        Returns
+        -------
+        origin : (3,) ndarray
+            Camera position in world coordinates
+
+        direction : (3,) ndarray
+            Normalized ray direction in world coordinates
+        """
+        R, t = extrinsics[0:3, 0:3], extrinsics[0:3, 3]
+        # Pixel -> camera ray
+        u, v = pixel
+        pixel_h = np.array([u, v, 1.0])
+
+        direction_cam = np.linalg.inv(K) @ pixel_h
+        direction_cam /= np.linalg.norm(direction_cam)
+
+        # Camera ray -> world ray
+        direction_world = R @ direction_cam
+        direction_world /= np.linalg.norm(direction_world)
+
+        # Camera position in world coordinates
+        origin_world = t
+
+        return origin_world, direction_world
+
+    def transform_points(self,points, rotation,translation):
+        rotated = points@rotation.T
+        translated = rotated +translation
+        return translated
+
+
+
+    def project_points_twod(self,points, extrinsics, intrinsics):
+
+        N = len(points)
+        pts_c = (extrinsics @ np.hstack([points, np.ones((N, 1))]).T).T
+        X, Y, Z = pts_c[:, 0], pts_c[:, 1], pts_c[:, 2]
+
+        u = (intrinsics[0, 0] * X / Z + intrinsics[0, 2]).astype(np.int32)
+        v = (intrinsics[1, 1] * Y / Z + intrinsics[1, 2]).astype(np.int32)
+
+        in_img = (u >= 0) & (u < self.img_w) & (v >= 0) & (v < self.img_h)
+        #u, v, Z = u[in_img], v[in_img], Z[in_img]
+
+
+        return u, v, in_img
+
+
+    def project_mesh(self, vertices, vert_colors, extrinsics, intrinsics,
+                     near=NEAR_CLIP, far=FAR_CLIP, pt_size=POINT_SIZE,IMG_W=224*2,IMG_H=224*2):
+
+
+        """
+        Project world-frame vertices into the camera defined by T_cw and global K.
+
+        Returns
+        -------
+        projected_colors : (H, W, 3) uint8   mesh colour per pixel (black = no data)
+        projection_ids   : (H, W)   int32    vertex .id per pixel  (−1   = no data)
+        """
+        T_cw=extrinsics
+        K =intrinsics
+        #IMG_W=224
+        #IMG_H=224
+        N = len(vertices)
+        pts_c = (T_cw @ np.hstack([vertices, np.ones((N, 1))]).T).T  # (N, 4)
+        X, Y, Z = pts_c[:, 0], pts_c[:, 1], pts_c[:, 2]
+
+        valid = (Z > near) & (Z < far)
+        X, Y, Z = X[valid], Y[valid], Z[valid]
+        c = vert_colors[valid]
+
+        u = (K[0, 0] * X / Z + K[0, 2]).astype(np.int32)
+        v = (K[1, 1] * Y / Z + K[1, 2]).astype(np.int32)
+
+        in_img = (u >= 0) & (u < IMG_W) & (v >= 0) & (v < IMG_H)
+        u, v, Z, c = u[in_img], v[in_img], Z[in_img], c[in_img]
+
+        # Z-buffer: paint far-to-near so closer points overwrite
+        order = np.argsort(Z)[::-1]
+        u, v, c = u[order], v[order], c[order]
+
+        proj_colors = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
+
+        if pt_size <= 1:
+            proj_colors[v, u] = c
+        else:
+            # Vectorised blob: loop over (2r+1)² offsets; each pass is fully vectorised
+            r = pt_size
+            dv_grid, du_grid = np.mgrid[-r:r + 1, -r:r + 1]
+            for dv, du in zip(dv_grid.ravel(), du_grid.ravel()):
+                vv = np.clip(v + dv, 0, IMG_H - 1)
+                uu = np.clip(u + du, 0, IMG_W - 1)
+                proj_colors[vv, uu] = c
+
+        return proj_colors
+
+
+    def center_substitute3(self,centervert):
+
+        radius=self.vol_radius
+
+        xyzcords=np.array([centervert + np.array([radius, 0, 0]),centervert + np.array([-radius, 0, 0]),centervert + np.array([0, radius, 0]),centervert + np.array([0, -radius, 0]),centervert + np.array([0, 0, radius]),centervert + np.array([0, 0, -radius]),centervert + np.array([radius*2, 0, 0]),centervert + np.array([-radius*2, 0, 0]),centervert + np.array([0, radius*2, 0]),centervert + np.array([0, -radius*2, 0]),centervert + np.array([0, 0, radius*2]),centervert + np.array([0, 0, -radius*2]),centervert + np.array([0, 0, 0])])
+        xyzrgb =np.array([np.array([254, 0, 0]),np.array([254, 0, 0]),np.array([0, 254, 0]),np.array([0, 254, 0]),np.array([0, 0, 254]),np.array([0, 0, 254]),np.array([254, 0, 0]),np.array([254, 0, 0]),np.array([0, 254, 0]),np.array([0, 254, 0]),np.array([0, 0, 254]),np.array([0, 0, 254]),np.array([254, 254, 254])])
+        return xyzcords, xyzrgb
+    def center_substitute2(self,centervert):
+
+        radius=self.vol_radius
+
+        xyzcords=np.array([centervert + np.array([radius/2, 0, 0]),centervert + np.array([-radius/2, 0, 0]),centervert + np.array([0, radius/2, 0]),centervert + np.array([0, -radius/2, 0]),centervert + np.array([0, 0, radius/2]),centervert + np.array([0, 0, -radius/2]),centervert + np.array([radius, 0, 0]),centervert + np.array([-radius, 0, 0]),centervert + np.array([0, radius, 0]),centervert + np.array([0, -radius, 0]),centervert + np.array([0, 0, radius]),centervert + np.array([0, 0, -radius]),centervert + np.array([0, 0, 0])])
+        xyzrgb =np.array([np.array([254, 0, 0]),np.array([254, 0, 0]),np.array([0, 254, 0]),np.array([0, 254, 0]),np.array([0, 0, 254]),np.array([0, 0, 254]),np.array([254, 0, 0]),np.array([254, 0, 0]),np.array([0, 254, 0]),np.array([0, 254, 0]),np.array([0, 0, 254]),np.array([0, 0, 254]),np.array([254, 254, 254])])
+        return xyzcords, xyzrgb
+    def center_substitute(self,centervert):
+
+        radius=self.vol_radius
+
+        xyzcords=np.array([centervert + np.array([radius, 0, 0]),centervert + np.array([-radius, 0, 0]),centervert + np.array([0, radius, 0]),centervert + np.array([0, -radius, 0]),centervert + np.array([0, 0, radius]),centervert + np.array([0, 0, -radius]),centervert + np.array([0, 0, 0])])
+        xyzrgb =np.array([np.array([254, 0, 0]),np.array([254, 0, 0]),np.array([0, 254, 0]),np.array([0, 254, 0]),np.array([0, 0, 254]),np.array([0, 0, 254]),np.array([254, 254, 254])])
+        return xyzcords, xyzrgb
+
+    def submap_gs_stitching_pipeline(self):
+        config = Config
+
+        for j in range(len(self.centers)):
+            #center = self.centers[j]
+            #extracted_center =self.vol_origins_extracted[j]
+            path = "/home/luis/Desktop/PythonProjects/2026-schmid-luis-mt/minisplatting2/output/gaussians"+str(self.vol_radius)+"m2picsoptim/gaussiansoptim" + str(
+                j) + ".ply"
+            ply = PlyData.read(path)
+
+            vetices = ply["vertex"].data
+            #vetices["x"] = vetices["x"] + center[0]
+            #vetices["y"] = vetices["y"] + center[1]
+            #vetices["z"] = vetices["z"] + center[2]
+            #crop_paths=list(filter(lambda x: x.startswith("center"+str(j)+"image"), sorted(list(self.center_shiftdict.keys()))))
+            #crop_paths=[crop_paths[0],crop_paths[-1]]
+            #imagenr1 = int(crop_paths[0].removeprefix("center" + str(j) + "image"))
+            #extrinsics1 = self.inverted_poses[imagenr1]
+            #extrinsics1 = self.poses[imagenr1]
+            #rotated_verts =self.transform_gaussians(vetices,extrinsics1[0:3,0:3])
+            rotated_verts =vetices
+            #rotated_verts["x"] = rotated_verts["x"] + center[0]
+            #rotated_verts["y"] = rotated_verts["y"] + center[1]
+            #rotated_verts["z"] = rotated_verts["z"] + center[2]
+            if j == 0:
+                corrected_verts = rotated_verts
+            else:
+                corrected_verts = np.concatenate([corrected_verts, rotated_verts])
+            print(j)
+
+        ply_out = PlyData([
+            PlyElement.describe(corrected_verts, "vertex")
+        ], text=False)
+        ply_out.write(
+            "/home/luis/Desktop/PythonProjects/2026-schmid-luis-mt/minisplatting2/output/gaussiansubmapstitch"+str(self.vol_radius)+"moptimv1.ply")
+        return
+
+    def load_poses(self,path: Path) -> np.ndarray:
+        """KITTI poses.txt (3×4 row-major per line) → (N, 4, 4) T_world_cam."""
+        poses = []
+        with open(path) as f:
+            for line in f:
+                vals = np.fromstring(line.strip(), sep=' ')
+                T = np.eye(4, dtype=np.float64)
+                T[:3, :] = vals.reshape(3, 4)
+                poses.append(T)
+        return np.stack(poses)
+
+    def invert_poses(self):
+        inv =np.copy(self.poses)
+        for i in range(len(self.poses)):
+            inv[i]= np.linalg.inv(inv[i])
+
+        return inv
+
+    def fetch_images(self):
+        i = self.frame_start
+        imges = []
+        while i <self.frame_end:
+            if i < 10:
+                imges.append(
+                    self.config.image_path+"/00000" + str(i) + ".png")
+            elif (i < 100) and (i > 9):
+                imges.append(
+                    self.config.image_path + "/0000" + str(i) + ".png")
+            else:
+                imges.append(
+                    self.config.image_path + "/000" + str(i) + ".png")
+            i+=1
+        for i in range(len(imges)):
+            img=Image.open(imges[i])
+            if img.mode == 'RGBA':
+                # Convert RGBA to RGB by removing alpha channel
+                img = img.convert('RGB')
+            imges[i] = np.asarray(img)
+        return imges
+
+    def fetch_centroids(self,radius):
+        pcd_masked = np.copy(self.pcd)
+        vol_origins = []
+        for i in pcd_masked:
+            flag = 0
+            for j in vol_origins:
+                if np.linalg.norm(np.array([i[0], i[1], i[2]]) - np.array([j[0], j[1], j[2]])) <= radius:
+                    flag = 1
+                    break
+            if flag == 1:
+                continue
+
+            vol_origins.append(i)
+        return vol_origins
+
+    def project_centers(self, image_nr):
+        """
+        Project world-frame vertices into the camera defined by T_cw and global K.
+
+        Returns
+        -------
+        projected_colors : (H, W, 3) uint8   mesh colour per pixel (black = no data)
+        projection_ids   : (H, W)   int32    vertex .id per pixel  (−1   = no data)
+        """
+        N = len(self.centers)
+        pts_c = (self.inverted_poses[image_nr] @ np.hstack([self.centers, np.ones((N, 1))]).T).T
+        X, Y, Z = pts_c[:, 0], pts_c[:, 1], pts_c[:, 2]
+
+        u = (self.K[0, 0] * X / Z + self.K[0, 2]).astype(np.int32)
+        v = (self.K[1, 1] * Y / Z + self.K[1, 2]).astype(np.int32)
+
+        in_img = (u >= 0) & (u < self.img_w) & (v >= 0) & (v < self.img_h)
+        #u, v, Z = u[in_img], v[in_img], Z[in_img]
+
+
+        return u, v, in_img
+
+    def extract_window_no_padding(self, image, original_center_x, original_center_y, size=224,plot=True):
+        """
+        Extract a size x size window centered as close as possible to
+        (center_x, center_y), shifting the window if near borders.
+        """
+        half = size // 2
+
+        h, w = image.shape[:2]
+
+        # Shift center so the window fits completely
+        center_x = np.clip(original_center_x, half, w - half)
+        center_y = np.clip(original_center_y, half, h - half)
+        centershift_x, centershift_y = center_x - original_center_x, center_y - original_center_y
+
+
+        x1 = center_x - half
+        x2 = center_x + half
+        y1 = center_y - half
+        y2 = center_y + half
+        crop = image[y1:y2, x1:x2]
+        if plot:
+            image1 = crop.copy()
+            image2 = image.copy()
+            for j in range(2):
+                image1[114-centershift_y][114-centershift_x] = [255, 0, 0]
+                image1[114-centershift_y + j][114-centershift_x] = [255, 0, 0]
+                image1[114-centershift_y - j][114-centershift_x] = [255, 0, 0]
+                image1[114-centershift_y][114-centershift_x + j] = [255, 0, 0]
+                image1[114-centershift_y][114-centershift_x - j] = [255, 0, 0]
+                image1[114-centershift_y + j][114-centershift_x+j] = [255, 0, 0]
+                image1[114-centershift_y - j][114-centershift_x - j] = [255, 0, 0]
+                image1[114-centershift_y- j][114-centershift_x + j] = [255, 0, 0]
+                image1[114-centershift_y+ j][114-centershift_x - j] = [255, 0, 0]
+                image2[original_center_y][original_center_x] = [255, 0, 0]
+                image2[original_center_y + j][original_center_x] = [255, 0, 0]
+                image2[original_center_y - j][original_center_x] = [255, 0, 0]
+                image2[original_center_y][original_center_x + j] = [255, 0, 0]
+                image2[original_center_y][original_center_x - j] = [255, 0, 0]
+                image2[original_center_y + j][original_center_x+j] = [255, 0, 0]
+                image2[original_center_y - j][original_center_x - j] = [255, 0, 0]
+                image2[original_center_y- j][original_center_x + j] = [255, 0, 0]
+                image2[original_center_y+ j][original_center_x - j] = [255, 0, 0]
+            f, axarr = plt.subplots(2, 1)
+            axarr[0].imshow(image1)
+            axarr[1].imshow(image2)
+
+            plt.show()
+
+        return crop,(centershift_x,centershift_y),(x1,y1)
+
+    def transform_gaussians(self,ply,R,translation=0):
+        #vertex = ply["vertex"].data
+        vertex=ply
+        rotation = Rotation.from_matrix(R)
+        xyz = np.stack([
+            vertex["x"],
+            vertex["y"],
+            vertex["z"]
+        ], axis=1)
+
+        # Quaternion fields used by Gaussian Splatting
+        quat = np.stack([
+            vertex["rot_0"],
+            vertex["rot_1"],
+            vertex["rot_2"],
+            vertex["rot_3"]
+        ], axis=1)
+
+        # Transform positions
+
+        #xyz_new = rotation.apply(xyz) + translation
+        xyz_new = rotation.apply(xyz)
+
+        # Transform orientations
+
+        rot_scene = rotation
+
+        quat_scipy = np.column_stack([
+            quat[:, 1],
+            quat[:, 2],
+            quat[:, 3],
+            quat[:, 0],
+        ])
+
+        gaussian_rot = Rotation.from_quat(quat_scipy)
+
+        new_rot = rot_scene * gaussian_rot
+
+        new_quat = new_rot.as_quat()
+
+        quat_out = np.column_stack([
+            new_quat[:, 3],  # w
+            new_quat[:, 0],  # x
+            new_quat[:, 1],  # y
+            new_quat[:, 2],  # z
+        ])
+
+        # Copy vertex data
+        new_vertex = vertex.copy()
+
+        new_vertex["x"] = xyz_new[:, 0]
+        new_vertex["y"] = xyz_new[:, 1]
+        new_vertex["z"] = xyz_new[:, 2]
+
+        new_vertex["rot_0"] = quat_out[:, 0]
+        new_vertex["rot_1"] = quat_out[:, 1]
+        new_vertex["rot_2"] = quat_out[:, 2]
+        new_vertex["rot_3"] = quat_out[:, 3]
+
+        return new_vertex
+
+    def transform_gaussians_any(self,gaussians,R,translation):
+        #vertex = ply["vertex"].data
+        #vertex=ply
+
+        xyz = gaussians.means[0].cpu().detach().numpy()
+        quat = gaussians.rotations[0].cpu().detach().numpy()
+
+        rotation = Rotation.from_matrix(R)
+
+        # Transform positions
+
+        xyz_new = rotation.apply(xyz) + translation
+
+        # Transform orientations
+
+        gaussian_rot = Rotation.from_quat(quat)
+
+        new_rot = rotation * gaussian_rot
+
+        new_quat = new_rot.as_quat()
+
+        means_tensor = torch.tensor(xyz_new, dtype=torch.float32, device="cuda")[None]
+        rotations_tensor = torch.tensor(new_quat, dtype=torch.float32, device="cuda")[None]
+
+        newgaussians = Gaussians(
+            means=means_tensor,
+            covariances=build_covariance(gaussians.scales,rotations_tensor),
+            # harmonics=rotate_sh(sh, c2w_rotations[..., None, :, :]),
+            harmonics=gaussians.harmonics,
+            opacities=gaussians.opacities,
+            # Note: These aren't yet rotated into world space, but they're only used for
+            # exporting Gaussians to ply files. This needs to be fixed...
+            scales=gaussians.scales,
+            rotations=rotations_tensor
+        )
+        return newgaussians
+
+    def new_extrinsics_gaussians_init(self,gaussians,extrinsics_oldcam, extrinsics_newcam, intrinsics):
+        #vertex = ply["vertex"].data
+        #vertex=ply
+        means = gaussians.means[0].clone().cpu().detach().numpy()
+        scales = gaussians.scales[0].clone().cpu().detach().numpy()
+        rotations = gaussians.rotations[0].clone().cpu().detach().numpy()
+        harmonics = gaussians.harmonics[0].clone().cpu().detach().numpy()
+        opacities = gaussians.opacities[0].clone().cpu().detach().numpy()
+
+        xyz = gaussians.means[0].cpu().detach().numpy()
+        quat = gaussians.rotations[0].cpu().detach().numpy()
+
+        rotation = Rotation.from_matrix(R)
+
+        # Transform positions
+
+        xyz_new = rotation.apply(xyz) + translation
+
+        # Transform orientations
+
+        gaussian_rot = Rotation.from_quat(quat)
+
+        new_rot = rotation * gaussian_rot
+
+        new_quat = new_rot.as_quat()
+
+        means_tensor = torch.tensor(xyz_new, dtype=torch.float32, device="cuda")[None]
+        rotations_tensor = torch.tensor(new_quat, dtype=torch.float32, device="cuda")[None]
+
+        newgaussians = Gaussians(
+            means=means_tensor,
+            covariances=build_covariance(gaussians.scales,rotations_tensor),
+            # harmonics=rotate_sh(sh, c2w_rotations[..., None, :, :]),
+            harmonics=gaussians.harmonics,
+            opacities=gaussians.opacities,
+            # Note: These aren't yet rotated into world space, but they're only used for
+            # exporting Gaussians to ply files. This needs to be fixed...
+            scales=gaussians.scales,
+            rotations=rotations_tensor
+        )
+        return newgaussians
+    def transform_gaussians_individual(self,gaussians,extrinsics,intrinsics, cropstarts, distance, targetpixel):
+        #vertex = ply["vertex"].data
+        #vertex=ply
+
+        mask = np.zeros(448*448*2)
+        for i in range(224):
+            for j in range(224):
+
+                mask[i*2+j*2*448] = 1
+                mask[(i*2+j*2*448)+448*448] = 1
+
+            #else:
+            #    mask[i] = i
+        mask = mask == 1
+        means = gaussians.means[0].clone().cpu().detach().numpy()
+        means=means.reshape((1,448,448,3))
+        #means = means[mask]
+        scales = gaussians.scales[0].clone().cpu().detach().numpy()[0:448*448]
+        #scales = scales[mask]
+        rotations = gaussians.rotations[0].clone().cpu().detach().numpy()
+        rotations = rotations.reshape((1, 448, 448, 4))
+        #rotations = rotations[mask]
+        harmonics = gaussians.harmonics[0].clone().cpu().detach().numpy()[0:448*448]
+        #harmonics = harmonics[mask]
+        opacities = gaussians.opacities[0].clone().cpu().detach().numpy()[0:448*448]
+        #opacities = opacities[mask]
+
+
+        for u in range(224):
+            for v in range(224):
+                pixel_flat_idx_v1 = (0 * 224 * 224) + (v * 224) + u
+                pixel_flat_idx_v2 = (1 * 224 * 224) + (v * 224) + u
+
+                origin_a, direction_a = self.pixel_to_world_ray(np.array([self.K[0, 2]-112+u, self.K[1, 2]-112+v]),self.K, extrinsics)
+                origin_b, direction_b = self.pixel_to_world_ray(np.array([cropstarts[0]+u, cropstarts[1]+v]),self.K, extrinsics)
+                #direction_a=np.array([0.66055805,0.04228673,0.74958315])
+                #direction_b=np.array([0.13456544,0.0583592,0.23754998])
+                #vec_b = np.array([0, 0, 0])
+                r = np.linalg.inv(self.rotation_matrix_from_vectors(direction_b, direction_a))
+                means[0,v*2,u*2,:]=r@means[0,v*2,u*2,:]
+                means[0,v*2+1,u*2,:]=r@means[0,v*2+1,u*2,:]
+                means[0,v*2,u*2+1,:]=r@means[0,v*2,u*2+1,:]
+                means[0,v*2+1,u*2+1,:]=r@means[0,v*2+1,u*2+1,:]
+                r = Rotation.from_matrix(r)
+
+                #means[pixel_flat_idx_v1]=r@means[pixel_flat_idx_v1]
+                #means[pixel_flat_idx_v2]=r@means[pixel_flat_idx_v2]
+                rotations[0,v*2,u*2,:]=(r *Rotation.from_quat(rotations[0,v*2,u*2,:])).as_quat()
+                rotations[0,v*2+1,u*2,:]=(r *Rotation.from_quat(rotations[0,v*2+1,u*2,:])).as_quat()
+                rotations[0,v*2,u*2+1,:]=(r *Rotation.from_quat(rotations[0,v*2,u*2+1,:])).as_quat()
+                rotations[0,v*2+1,u*2+1,:]=(r *Rotation.from_quat(rotations[0,v*2+1,u*2+1,:])).as_quat()
+
+                #gaussian_rot1 = Rotation.from_quat(rotations[pixel_flat_idx_v1])
+                #new_rot1 = r * gaussian_rot1
+                #gaussian_rot2 = Rotation.from_quat(rotations[pixel_flat_idx_v2])
+                #new_rot2 = r * gaussian_rot2
+                #rotations[pixel_flat_idx_v1]=new_rot1.as_quat()
+                #rotations[pixel_flat_idx_v2]=new_rot2.as_quat()
+        centerpt=means[0,targetpixel[1]*2,targetpixel[0]*2,:]
+        dist = np.linalg.norm(centerpt-origin_b)
+        distscale=distance/dist
+        means=((means.reshape((448*448,3))[0:448*448]-np.array(origin_b))*distscale)+np.array(origin_b)
+        means_t = torch.tensor(means, dtype=torch.float32, device="cuda")[None]
+        print(np.linalg.norm(means[(targetpixel[1]*2 * 448) + targetpixel[0]*2]-origin_b))
+        print(distance)
+        print('distances above')
+        #means_t = torch.tensor(means.reshape((448*448,3))[0:448*448], dtype=torch.float32, device="cuda")[None]
+        scales_t = torch.tensor(scales*distscale, dtype=torch.float32, device="cuda")[None]
+        rotations_t = torch.tensor(rotations.reshape((448*448,4))[0:448*448], dtype=torch.float32, device="cuda")[None]
+        harmonics_t = torch.tensor(harmonics, dtype=torch.float32, device="cuda")[None]
+        opacities_t = torch.tensor(opacities, dtype=torch.float32, device="cuda")[None]
+        covariances_t=build_covariance(scales_t, rotations_t)
+        v1_gs_og, v1_gs_og_depth = self.render_splat_ret_img(means=gaussians.means,
+                                                   scale=gaussians.scales,
+                                                   rot=gaussians.rotations,
+                                                   harmonics=gaussians.harmonics,
+                                                   opacity=gaussians.opacities,
+                                                   covariance=gaussians.covariances,
+                                                   extrinsics=extrinsics,
+                                                   intrinsics=intrinsics,
+                                                   h=224,
+                                                   w=224)
+
+        v1_gs_reduced, v1_gs_reduced_depth = self.render_splat_ret_img(means=means_t,
+                                                   scale=scales_t,
+                                                   rot=rotations_t,
+                                                   harmonics=harmonics_t,
+                                                   opacity=opacities_t,
+                                                   covariance=covariances_t,
+                                                   extrinsics=extrinsics,
+                                                   intrinsics=self.K,
+                                                   h=self.img_h,
+                                                   w=self.img_w)
+        '''f, axarr = plt.subplots(3)
+        axarr[0].imshow(v1_gs_og)
+        axarr[0].set_title('v1_gs_og')
+        axarr[1].imshow(v1_gs_reduced)
+        axarr[1].set_title('v1_gs_reduced')
+        axarr[2].imshow(v1_gs_reduced[cropstarts[1]:cropstarts[1] + 224, cropstarts[0]:cropstarts[0] + 224, :])
+        axarr[2].set_title('v1_gs_reducedcropped')
+        plt.show()
+        time.sleep(1)'''
+        newgaussians = Gaussians(
+            means=means_t,
+            covariances=covariances_t,
+            # harmonics=rotate_sh(sh, c2w_rotations[..., None, :, :]),
+            harmonics=harmonics_t,
+            opacities=opacities_t,
+            # Note: These aren't yet rotated into world space, but they're only used for
+            # exporting Gaussians to ply files. This needs to be fixed...
+            scales=scales_t,
+            rotations=rotations_t
+        )
+
+        return newgaussians,means[(targetpixel[1]*2 * 448) + targetpixel[0]*2]
+
+    def transform_gaussians_individual2(self,gaussians,extrinsics,intrinsics, cropstarts, distance, targetpixel, og_extrinsics):
+        #vertex = ply["vertex"].data
+        #vertex=ply
+
+        mask = np.zeros(448*448*2)
+        for i in range(224):
+            for j in range(224):
+
+                mask[i*2+j*2*448] = 1
+                mask[(i*2+j*2*448)+448*448] = 1
+
+            #else:
+            #    mask[i] = i
+        mask = mask == 1
+        means = gaussians.means[0].clone().cpu().detach().numpy()
+        means2 = gaussians.means[0].clone().cpu().detach().numpy()
+        means=means.reshape((1,448,448,3))
+        #means = means[mask]
+        scales = gaussians.scales[0].clone().cpu().detach().numpy()[0:448*448]
+        #scales = scales[mask]
+        rotations = gaussians.rotations[0].clone().cpu().detach().numpy()
+        rotations = rotations.reshape((1, 448, 448, 4))
+        #rotations = rotations[mask]
+        harmonics = gaussians.harmonics[0].clone().cpu().detach().numpy()[0:448*448]
+        #harmonics = harmonics[mask]
+        opacities = gaussians.opacities[0].clone().cpu().detach().numpy()[0:448*448]
+        #opacities = opacities[mask]
+
+
+        for u in range(224):
+            for v in range(224):
+                pixel_flat_idx_v1 = (0 * 224 * 224) + (v * 224) + u
+                pixel_flat_idx_v2 = (1 * 224 * 224) + (v * 224) + u
+
+                origin_a, direction_a = self.pixel_to_world_ray(np.array([self.K[0, 2]-112+u, self.K[1, 2]-112+v]),self.K, extrinsics)
+                origin_b, direction_b = self.pixel_to_world_ray(np.array([cropstarts[0]+u, cropstarts[1]+v]),self.K, extrinsics)
+                #direction_a=np.array([0.66055805,0.04228673,0.74958315])
+                #direction_b=np.array([0.13456544,0.0583592,0.23754998])
+                #vec_b = np.array([0, 0, 0])
+                r = np.linalg.inv(self.rotation_matrix_from_vectors(direction_b, direction_a))
+                means[0,v*2,u*2,:]=r@means[0,v*2,u*2,:]
+                means[0,v*2+1,u*2,:]=r@means[0,v*2+1,u*2,:]
+                means[0,v*2,u*2+1,:]=r@means[0,v*2,u*2+1,:]
+                means[0,v*2+1,u*2+1,:]=r@means[0,v*2+1,u*2+1,:]
+                r = Rotation.from_matrix(r)
+
+                #means[pixel_flat_idx_v1]=r@means[pixel_flat_idx_v1]
+                #means[pixel_flat_idx_v2]=r@means[pixel_flat_idx_v2]
+                rotations[0,v*2,u*2,:]=(r *Rotation.from_quat(rotations[0,v*2,u*2,:])).as_quat()
+                rotations[0,v*2+1,u*2,:]=(r *Rotation.from_quat(rotations[0,v*2+1,u*2,:])).as_quat()
+                rotations[0,v*2,u*2+1,:]=(r *Rotation.from_quat(rotations[0,v*2,u*2+1,:])).as_quat()
+                rotations[0,v*2+1,u*2+1,:]=(r *Rotation.from_quat(rotations[0,v*2+1,u*2+1,:])).as_quat()
+
+                #gaussian_rot1 = Rotation.from_quat(rotations[pixel_flat_idx_v1])
+                #new_rot1 = r * gaussian_rot1
+                #gaussian_rot2 = Rotation.from_quat(rotations[pixel_flat_idx_v2])
+                #new_rot2 = r * gaussian_rot2
+                #rotations[pixel_flat_idx_v1]=new_rot1.as_quat()
+                #rotations[pixel_flat_idx_v2]=new_rot2.as_quat()
+        centerpt=means[0,targetpixel[1]*2,targetpixel[0]*2,:]
+        dist = np.linalg.norm(centerpt-origin_b)
+        distscale=distance/dist
+        means=((means.reshape((448*448,3))[0:448*448]-np.array(origin_b))*distscale)+np.array(origin_b)
+        means_t = torch.tensor(means, dtype=torch.float32, device="cuda")[None]
+        print(np.linalg.norm(means[(targetpixel[1]*2 * 448) + targetpixel[0]*2]-origin_b))
+        print(distance)
+        print('distances above')
+
+        origin_og, direction_og = self.pixel_to_world_ray(np.array([targetpixel[0]+cropstarts[0], targetpixel[1]+cropstarts[1]]),self.K, og_extrinsics)
+        origin_pred,direction_pred = self.pixel_to_world_ray(np.array([targetpixel[0]*2, targetpixel[1]*2]),self.K, extrinsics)
+        r_global = np.linalg.inv(self.rotation_matrix_from_vectors(direction_og, direction_pred))
+        means_centroid_pred = means2[(targetpixel[1]*2 * 448) + targetpixel[0]*2]
+        rotated_center = (r_global @ (means_centroid_pred-origin_pred))+origin_og
+        means_global = origin_og+direction_og*distance
+        print('sanitycheck targetpixels:',targetpixel[0], targetpixel[1],targetpixel[0]+cropstarts[0], targetpixel[1]+cropstarts[1])
+
+        #means_t = torch.tensor(means.reshape((448*448,3))[0:448*448], dtype=torch.float32, device="cuda")[None]
+        scales_t = torch.tensor(scales*distscale, dtype=torch.float32, device="cuda")[None]
+        rotations_t = torch.tensor(rotations.reshape((448*448,4))[0:448*448], dtype=torch.float32, device="cuda")[None]
+        harmonics_t = torch.tensor(harmonics, dtype=torch.float32, device="cuda")[None]
+        opacities_t = torch.tensor(opacities, dtype=torch.float32, device="cuda")[None]
+        covariances_t=build_covariance(scales_t, rotations_t)
+        v1_gs_og, v1_gs_og_depth = self.render_splat_ret_img(means=gaussians.means,
+                                                   scale=gaussians.scales,
+                                                   rot=gaussians.rotations,
+                                                   harmonics=gaussians.harmonics,
+                                                   opacity=gaussians.opacities,
+                                                   covariance=gaussians.covariances,
+                                                   extrinsics=extrinsics,
+                                                   intrinsics=intrinsics,
+                                                   h=224,
+                                                   w=224)
+
+        v1_gs_reduced, v1_gs_reduced_depth = self.render_splat_ret_img(means=means_t,
+                                                   scale=scales_t,
+                                                   rot=rotations_t,
+                                                   harmonics=harmonics_t,
+                                                   opacity=opacities_t,
+                                                   covariance=covariances_t,
+                                                   extrinsics=extrinsics,
+                                                   intrinsics=self.K,
+                                                   h=self.img_h,
+                                                   w=self.img_w)
+        '''f, axarr = plt.subplots(3)
+        axarr[0].imshow(v1_gs_og)
+        axarr[0].set_title('v1_gs_og')
+        axarr[1].imshow(v1_gs_reduced)
+        axarr[1].set_title('v1_gs_reduced')
+        axarr[2].imshow(v1_gs_reduced[cropstarts[1]:cropstarts[1] + 224, cropstarts[0]:cropstarts[0] + 224, :])
+        axarr[2].set_title('v1_gs_reducedcropped')
+        plt.show()
+        time.sleep(1)'''
+        newgaussians = Gaussians(
+            means=means_t,
+            covariances=covariances_t,
+            # harmonics=rotate_sh(sh, c2w_rotations[..., None, :, :]),
+            harmonics=harmonics_t,
+            opacities=opacities_t,
+            # Note: These aren't yet rotated into world space, but they're only used for
+            # exporting Gaussians to ply files. This needs to be fixed...
+            scales=scales_t,
+            rotations=rotations_t
+        )
+
+        return newgaussians,means[(targetpixel[1]*2 * 448) + targetpixel[0]*2]
+
+
+def main():
+    meshpath = "/home/luis/Desktop/SABERGUIDE/KITTI/kitti_seq10_gt/mesh_kf000001.ply"
+    framestart=0
+    frameend=34
+    submap = Submap(Config, framestart, frameend)
+    submap.init_geometry(meshpath)
+    submap.init_model()
+    submap.init_model_inputs()
+    submap.pipeline_foward()
+    submap.submap_gs_stitching_pipeline()
+    #submap_pipeline(meshpath)
+    #submap_gs_stitching_pipeline(meshpath)
+    return
+
+
+if __name__ == '__main__':
+    sys.exit(main())

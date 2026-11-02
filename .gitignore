@@ -1,0 +1,11 @@
+data/**
+**.log
+.idea/**
+**.html
+mini-splatting2/submodules/diff-gaussian-rasterization/third_party/glm/doc/**
+mini-splatting2/triangle-splatting/
+mini-splatting2/submodules/
+mini-splatting2/testresults/
+Anysplat/pics/
+**.csv
+**kitti**
